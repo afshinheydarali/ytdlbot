@@ -104,20 +104,24 @@ class YoutubeDownload(BaseDownloader):
             "embed_thumbnail": True,
             "writethumbnail": False,
         }
-        # setup cookies for youtube only
+        # setup cookies and JS challenge support for youtube only
         if is_youtube(self._url):
             # use cookies from browser firstly
             if browsers := os.getenv("BROWSERS"):
                 ydl_opts["cookiesfrombrowser"] = browsers.split(",")
             if os.path.isfile("youtube-cookies.txt") and os.path.getsize("youtube-cookies.txt") > 100:
                 ydl_opts["cookiefile"] = "youtube-cookies.txt"
-            # try add extract_args if present
+
+            deno_path = os.getenv("YOUTUBE_DENO_PATH", "/root/.deno/bin/deno")
+            if deno_path and os.path.isfile(deno_path):
+                ydl_opts["js_runtimes"] = {"deno": {"path": deno_path}}
+                ydl_opts["remote_components"] = {"ejs:github"}
+
+            ydl_opts["extractor_args"] = {"youtube": {"player_client": ["web"]}}
+
+            # try add po token if present
             if potoken := os.getenv("POTOKEN"):
-                ydl_opts["extractor_args"] = {"youtube": ["player-client=web,default", f"po_token=web+{potoken}"]}
-                # for new version? https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
-                # ydl_opts["extractor_args"] = {
-                #     "youtube": [f"po_token=web.player+{potoken}", f"po_token=web.gvs+{potoken}"]
-                # }
+                ydl_opts["extractor_args"]["youtube"]["po_token"] = [f"web+{potoken}"]
 
         if self._url.startswith("https://drive.google.com"):
             # Always use the `source` format for Google Drive URLs.

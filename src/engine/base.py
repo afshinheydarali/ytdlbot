@@ -6,6 +6,7 @@
 import hashlib
 import json
 import logging
+import os
 import re
 import tempfile
 import uuid
@@ -31,6 +32,15 @@ from database.model import (
     use_quota,
 )
 from engine.helper import debounce, sizeof_fmt
+from utils.gdrive import upload_files
+
+
+def gdrive_enabled() -> bool:
+    return os.getenv("ENABLE_GDRIVE_UPLOAD", "").lower() in {"1", "true", "yes", "on"}
+
+
+def gdrive_only() -> bool:
+    return os.getenv("GDRIVE_ONLY", "").lower() in {"1", "true", "yes", "on"}
 
 
 def generate_input_media(file_paths: list, cap: str) -> list:
@@ -119,11 +129,10 @@ class BaseDownloader(ABC):
             downloaded = d.get("downloaded_bytes", 0)
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
 
-            if total > TG_NORMAL_MAX_SIZE:
+            if total > TG_NORMAL_MAX_SIZE and not gdrive_only():
                 msg = f"Your download file size {sizeof_fmt(total)} is too large for Telegram."
                 raise Exception(msg)
 
-            # percent = remove_bash_color(d.get("_percent_str", "N/A"))
             speed = self.__remove_bash_color(d.get("_speed_str", "N/A"))
             eta = self.__remove_bash_color(d.get("_eta_str", d.get("eta")))
             text = self.__tqdm_progress("Downloading...", total, downloaded, speed, eta)
@@ -205,10 +214,9 @@ class BaseDownloader(ABC):
             logging.error("Error while getting metadata: %s", e)
         try:
             thumb = Path(video_path).parent.joinpath(f"{uuid.uuid4().hex}-thunmnail.png").as_posix()
-            # A thumbnail's width and height should not exceed 320 pixels.
             ffmpeg.input(video_path, ss=duration / 2).filter(
                 "scale",
-                "if(gt(iw,ih),300,-1)",  # If width > height, scale width to 320 and height auto
+                "if(gt(iw,ih),300,-1)",
                 "if(gt(iw,ih),-1,300)",
             ).output(thumb, vframes=1).run()
         except ffmpeg._run.Error:
@@ -217,11 +225,37 @@ class BaseDownloader(ABC):
         caption = f"{self._url}\n{filename}\n\nResolution: {width}x{height}\nDuration: {duration} seconds"
         return dict(height=height, width=width, duration=duration, thumb=thumb, caption=caption)
 
+    def _upload_to_gdrive(self, files, meta):
+        if not gdrive_enabled():
+            return None
+        real_files = [Path(f) for f in files if Path(f).is_file()]
+        if not real_files:
+            return None
+        self._bot_msg.edit_text("Uploading to Google Drive...")
+        folder_name = None
+        if os.getenv("GDRIVE_FOLDER_BY_CHAT", "").lower() in {"1", "true", "yes", "on"}:
+            folder_name = str(self._chat_id)
+        uploads = upload_files(real_files, folder_name=folder_name)
+        if not uploads:
+            return None
+        lines = ["✅ Uploaded to Google Drive:"]
+        for item in uploads:
+            link = item.get("webViewLink") or item.get("webContentLink") or item.get("id")
+            lines.append(f"• {item.get('name')}: {link}")
+        text = "\n".join(lines)
+        self._client.send_message(self._chat_id, text, disable_web_page_preview=True)
+        return uploads
+
     def _upload(self, files=None, meta=None):
         if files is None:
             files = list(Path(self._tempdir.name).glob("*"))
         if meta is None:
             meta = self.get_metadata()
+
+        uploads = self._upload_to_gdrive(files, meta)
+        if gdrive_only() and uploads:
+            self._bot_msg.edit_text("✅ Success")
+            return SimpleNamespace(document=None, video=None, audio=None, animation=None, photo=None)
 
         success = SimpleNamespace(document=None, video=None, audio=None, animation=None, photo=None)
         if self._format == "document":
@@ -254,11 +288,9 @@ class BaseDownloader(ABC):
             logging.info("Sending as video for %s", self._url)
             attempt_methods = ["video", "animation", "audio", "photo"]
             video_meta = meta.copy()
-
-            upload_successful = False  # Flag to track if any method succeeded
+            upload_successful = False
             for method in attempt_methods:
                 current_meta = video_meta.copy()
-
                 if method == "photo":
                     current_meta.pop("thumb", None)
                     current_meta.pop("duration", None)
@@ -267,33 +299,19 @@ class BaseDownloader(ABC):
                 elif method == "audio":
                     current_meta.pop("height", None)
                     current_meta.pop("width", None)
-
                 try:
-                    success_obj = self.send_something(
+                    success = self.send_something(
                         chat_id=self._chat_id,
                         files=files,
                         _type=method,
-                        **current_meta
+                        **current_meta,
                     )
-
-                    if method == "video":
-                        success = success_obj
-                    elif method == "animation":
-                        success = success_obj
-                    elif method == "photo":
-                        success = success_obj
-                    elif method == "audio":
-                        success = success_obj
-
-                    upload_successful = True # Set flag to True on success
+                    upload_successful = True
                     break
                 except Exception as e:
                     logging.error("Retry to send as %s, error: %s", method, e)
-
-            # Check the flag after the loop
             if not upload_successful:
                 raise ValueError("ERROR: For direct links, try again with `/direct`.")
-
         else:
             logging.error("Unknown upload format settings for %s", self._format)
             return
@@ -304,9 +322,7 @@ class BaseDownloader(ABC):
             "file_id": json.dumps([getattr(obj, "file_id", None)]),
             "meta": json.dumps({k: v for k, v in meta.items() if k != "thumb"}, ensure_ascii=False),
         }
-
         self._redis.add_cache(video_key, mapping)
-        # change progress bar to done
         self._bot_msg.edit_text("✅ Success")
         return success
 

@@ -27,6 +27,7 @@ class YoutubeDownload(BaseDownloader):
         return [
             f"bestvideo[ext=mp4][height={m}]+bestaudio[ext=m4a]",
             f"bestvideo[vcodec^=avc][height={m}]+bestaudio[acodec^=mp4a]/best[vcodec^=avc]/best",
+            f"best[height<={m}]/bestvideo[height<={m}]+bestaudio/best",
         ]
 
     def _setup_formats(self) -> list | None:
@@ -38,20 +39,21 @@ class YoutubeDownload(BaseDownloader):
         # format: audio, video, document
         formats = []
         defaults = [
-            # webm , vp9 and av01 are not streamable on telegram, so we'll extract only mp4
-            "bestvideo[ext=mp4][vcodec!*=av01][vcodec!*=vp09]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+            # webm , vp9 and av01 are not streamable on telegram, so prefer mp4 first
+            "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
             "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/best[vcodec^=avc]/best",
+            "18/best[height<=720]/best",
             None,
         ]
         audio = AUDIO_FORMAT or "m4a"
         maps = {
-            "high-audio": [f"bestaudio[ext={audio}]"],
+            "high-audio": [f"bestaudio[ext={audio}]/bestaudio/best"],
             "high-video": defaults,
             "high-document": defaults,
-            "medium-audio": [f"bestaudio[ext={audio}]"],  # no mediumaudio :-(
+            "medium-audio": [f"bestaudio[ext={audio}]/bestaudio/best"],
             "medium-video": self.get_format(720),
             "medium-document": self.get_format(720),
-            "low-audio": [f"bestaudio[ext={audio}]"],
+            "low-audio": [f"bestaudio[ext={audio}]/bestaudio/best"],
             "low-video": self.get_format(480),
             "low-document": self.get_format(480),
             "custom-audio": "",
@@ -62,24 +64,6 @@ class YoutubeDownload(BaseDownloader):
         if quality == "custom":
             pass
             # TODO not supported yet
-            # get format from ytdlp, send inlinekeyboard button to user so they can choose
-            # another callback will be triggered to download the video
-            # available_options = {
-            #     "480P": "best[height<=480]",
-            #     "720P": "best[height<=720]",
-            #     "1080P": "best[height<=1080]",
-            # }
-            # markup, temp_row = [], []
-            # for quality, data in available_options.items():
-            #     temp_row.append(types.InlineKeyboardButton(quality, callback_data=data))
-            #     if len(temp_row) == 3:  # Add a row every 3 buttons
-            #         markup.append(temp_row)
-            #         temp_row = []
-            # # Add any remaining buttons as the last row
-            # if temp_row:
-            #     markup.append(temp_row)
-            # self._bot_msg.edit_text("Choose the format", reply_markup=types.InlineKeyboardMarkup(markup))
-            # return None
 
         formats.extend(maps[f"{quality}-{format_}"])
         # extend default formats if not high*
@@ -128,14 +112,23 @@ class YoutubeDownload(BaseDownloader):
             formats = ["source"] + formats
 
         files = None
+        last_error = None
         for f in formats:
             ydl_opts["format"] = f
             logging.info("yt-dlp options: %s", ydl_opts)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([self._url])
-            files = list(Path(self._tempdir.name).glob("*"))
-            break
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([self._url])
+                files = list(Path(self._tempdir.name).glob("*"))
+                if files:
+                    break
+            except yt_dlp.utils.DownloadError as e:
+                last_error = e
+                logging.warning("Format %s failed for %s: %s", f, self._url, e)
+                continue
 
+        if not files and last_error:
+            raise last_error
         return files
 
     def _start(self, formats=None):
